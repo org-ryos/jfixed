@@ -1,12 +1,16 @@
 package io.ryos.jfixed.core;
 
 import io.ryos.jfixed.annotation.FixedField;
+import io.ryos.jfixed.annotation.FixedSection;
+import io.ryos.jfixed.annotation.FixedStructure;
 import io.ryos.jfixed.converter.ConverterRegistry;
 import io.ryos.jfixed.exception.FixedLengthException;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * main logic of analyze fixed-text data
@@ -22,10 +26,10 @@ public class FixedLengthEngine {
      */
     public FixedLengthEngine(Charset charset, ConverterRegistry converterRegistry) {
         if (charset == null) {
-            throw new IllegalArgumentException("charset must be null");
+            throw new IllegalArgumentException("charset must not be null");
         }
         if (converterRegistry == null) {
-            throw new IllegalArgumentException("converterRegistry must be null");
+            throw new IllegalArgumentException("converterRegistry must not be null");
         }
         this.charset = charset;
         this.registry = converterRegistry;
@@ -41,10 +45,10 @@ public class FixedLengthEngine {
      */
     public <T> T process(String line, Class<T> clazz, int lineNumber) throws Exception {
         if (line == null) {
-            throw new IllegalArgumentException("line must be null");
+            throw new IllegalArgumentException("line must not be null");
         }
         if (clazz == null) {
-            throw new IllegalArgumentException("clazz must be null");
+            throw new IllegalArgumentException("clazz must not be null");
         }
         try {
             if (clazz.isRecord()) {
@@ -105,7 +109,18 @@ public class FixedLengthEngine {
      * @throws Exception
      */
     private <T> T processPojo(String line, Class<T> clazz, int lineNumber) throws Exception {
-        T instance = clazz.getDeclaredConstructor().newInstance();
+        Field[] fields = clazz.getDeclaredFields();
+
+        // try to create Instance without arguments
+        Constructor<T> noArgsConstructor;
+        try {
+            noArgsConstructor = clazz.getDeclaredConstructor();
+        } catch (NoSuchMethodException e) {
+            // if there is no non-Args Constructor, try to create constructor with all fields
+            return processRecord(line, clazz, lineNumber);
+        }
+
+        T instance = noArgsConstructor.newInstance();
 
         for (Field field : clazz.getDeclaredFields()) {
             FixedField config = field.getAnnotation(FixedField.class);
@@ -128,7 +143,7 @@ public class FixedLengthEngine {
      * @return value of field
      */
     private Object extractAndConvert(String line, Field field, FixedField config, int lineNumber) {
-        String rawValue = "";
+        String rawValue;
         try {
             // 1. バイト単位での切り出し（ByteSlicerの役割を内包または呼び出し）
             rawValue = ByteSlicer.slice(line, config.offset(), config.length(), charset);
@@ -152,6 +167,329 @@ public class FixedLengthEngine {
         }
     }
 
+    /**
+     * Processes a structured fixed-length data file with Header, Data (repeatable), Trailer, and End sections.
+     * 
+     * @param lines list of lines representing the structure
+     * @param structureClass class annotated with @FixedStructure that defines the structure
+     * @return instance of structureClass with parsed data
+     * @throws Exception if processing fails
+     */
+    public <T> T processStructure(List<String> lines, Class<T> structureClass) throws Exception {
+        if (lines == null || lines.isEmpty()) {
+            throw new IllegalArgumentException("lines must not be null or empty");
+        }
+        if (structureClass == null) {
+            throw new IllegalArgumentException("structureClass must not be null");
+        }
+        
+        FixedStructure structureAnnotation = structureClass.getAnnotation(FixedStructure.class);
+        if (structureAnnotation == null) {
+            throw new IllegalArgumentException("structureClass must be annotated with @FixedStructure");
+        }
+        
+        try {
+            // Analyze structure fields
+            StructureInfo info = analyzeStructure(structureClass, structureAnnotation);
+            
+            // Process lines
+            Object header = null;
+            List<Object> dataList = new ArrayList<>();
+            Object trailer = null;
+            Object end = null;
+            
+            for (int i = 0; i < lines.size(); i++) {
+                String line = lines.get(i);
+                String lineIdentifier = extractLineIdentifier(line, info.lineIdentifierField, structureAnnotation, info);
+                
+                if (lineIdentifier.equals(structureAnnotation.headerIdentifier())) {
+                    if (header != null) {
+                        throw new FixedLengthException(
+                            "Multiple header records found",
+                            i + 1,
+                            null,
+                            line,
+                            null
+                        );
+                    }
+                    header = process(line, info.headerClass, i + 1);
+                } else if (lineIdentifier.equals(structureAnnotation.dataIdentifier())) {
+                    Object data = process(line, info.dataClass, i + 1);
+                    dataList.add(data);
+                } else if (lineIdentifier.equals(structureAnnotation.trailerIdentifier())) {
+                    if (trailer != null) {
+                        throw new FixedLengthException(
+                            "Multiple trailer records found",
+                            i + 1,
+                            null,
+                            line,
+                            null
+                        );
+                    }
+                    trailer = process(line, info.trailerClass, i + 1);
+                } else if (lineIdentifier.equals(structureAnnotation.endIdentifier())) {
+                    if (end != null) {
+                        throw new FixedLengthException(
+                            "Multiple end records found",
+                            i + 1,
+                            null,
+                            line,
+                            null
+                        );
+                    }
+                    end = process(line, info.endClass, i + 1);
+                } else {
+                    throw new FixedLengthException(
+                        "Unknown line identifier: " + lineIdentifier,
+                        i + 1,
+                        null,
+                        line,
+                        null
+                    );
+                }
+            }
+            
+            // Validate required sections
+            if (header == null && info.headerClass != null) {
+                throw new FixedLengthException("Header record is required but not found", 0, null, null, null);
+            }
+            if (trailer == null && info.trailerClass != null) {
+                throw new FixedLengthException("Trailer record is required but not found", 0, null, null, null);
+            }
+            if (end == null && info.endClass != null) {
+                throw new FixedLengthException("End record is required but not found", 0, null, null, null);
+            }
+            
+            // Create structure instance
+            return createStructureInstance(structureClass, info, header, dataList, trailer, end);
+            
+        } catch (FixedLengthException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new FixedLengthException(
+                "Failed to process structure: " + e.getMessage(),
+                0,
+                null,
+                null,
+                e
+            );
+        }
+    }
+    
+    /**
+     * Analyzes the structure class to identify section fields and their types.
+     */
+    private StructureInfo analyzeStructure(Class<?> structureClass, FixedStructure annotation) {
+        StructureInfo info = new StructureInfo();
+        info.lineIdentifierField = annotation.lineIdentifierField();
+        
+        Field[] fields = structureClass.getDeclaredFields();
+        for (Field field : fields) {
+            FixedSection section = field.getAnnotation(FixedSection.class);
+            if (section == null) continue;
+            
+            field.setAccessible(true);
+            Class<?> fieldType = field.getType();
+            
+            switch (section.value()) {
+                case HEADER:
+                    info.headerField = field;
+                    info.headerClass = fieldType;
+                    break;
+                case DATA:
+                    info.dataField = field;
+                    // For List<T>, extract T
+                    if (List.class.isAssignableFrom(fieldType)) {
+                        // Get generic type parameter
+                        java.lang.reflect.ParameterizedType listType = 
+                            (java.lang.reflect.ParameterizedType) field.getGenericType();
+                        info.dataClass = (Class<?>) listType.getActualTypeArguments()[0];
+                    } else {
+                        throw new IllegalArgumentException(
+                            "Data field must be of type List<T>, but found: " + fieldType
+                        );
+                    }
+                    break;
+                case TRAILER:
+                    info.trailerField = field;
+                    info.trailerClass = fieldType;
+                    break;
+                case END:
+                    info.endField = field;
+                    info.endClass = fieldType;
+                    break;
+            }
+        }
+        
+        return info;
+    }
+    
+    /**
+     * Extracts the line identifier from a line by trying to parse it with each section class
+     * and checking the identifier field value.
+     */
+    private String extractLineIdentifier(String line, String identifierFieldName, FixedStructure annotation,
+                                        StructureInfo info) {
+        if (identifierFieldName == null || identifierFieldName.isEmpty()) {
+            // If no identifier field is specified, use the first character
+            return !line.isEmpty() ? line.substring(0, 1) : "";
+        }
+        // get byte length of record
+        int lineByteLength = line.getBytes(charset).length;
+
+        if (info.endClass != null && lineByteLength <= 400) {
+            try {
+                Object section = process(line, info.endClass, 1);
+                Field identifierField = findFieldByName(info.endClass, identifierFieldName);
+                if (identifierField != null) {
+                    identifierField.setAccessible(true);
+                    Object value = identifierField.get(section);
+                    if (value != null) {
+                        String identifier = value.toString().trim();
+                        if (identifier.equals(annotation.endIdentifier())) {
+                            return identifier;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // try to extract by another class
+            }
+        }
+
+        // Try to parse with each section class and extract identifier
+        Class<?>[] sectionClasses = {info.headerClass, info.dataClass, info.trailerClass, info.endClass};
+        for (Class<?> sectionClass : sectionClasses) {
+            if (sectionClass == null) continue;
+            
+            try {
+                Object section = process(line, sectionClass, 1);
+                Field identifierField = findFieldByName(sectionClass, identifierFieldName);
+                if (identifierField != null) {
+                    identifierField.setAccessible(true);
+                    Object value = identifierField.get(section);
+                    if (value != null) {
+                        return value.toString().trim();
+                    }
+                }
+            } catch (Exception e) {
+                // Try next class
+            }
+        }
+        
+        // Fallback: use first character
+        return !line.isEmpty() ? line.substring(0, 1) : "";
+    }
+    
+    /**
+     * Finds a field by name in a class (including inherited fields).
+     */
+    private Field findFieldByName(Class<?> clazz, String fieldName) {
+        Class<?> current = clazz;
+        while (current != null) {
+            try {
+                return current.getDeclaredField(fieldName);
+            } catch (NoSuchFieldException e) {
+                current = current.getSuperclass();
+            }
+        }
+        return null;
+    }
+    
+    /**
+     * Creates an instance of the structure class with all sections populated.
+     */
+    private <T> T createStructureInstance(Class<T> structureClass, StructureInfo info,
+                                          Object header, List<Object> dataList, Object trailer, Object end) throws Exception {
+        if (structureClass.isRecord()) {
+            return createRecordInstance(structureClass, info, header, dataList, trailer, end);
+        } else {
+            return createPojoInstance(structureClass, info, header, dataList, trailer, end);
+        }
+    }
+    
+    private <T> T createRecordInstance(Class<T> structureClass, StructureInfo info,
+                                       Object header, List<Object> dataList, Object trailer, Object end) throws Exception {
+        Field[] fields = structureClass.getDeclaredFields();
+        Object[] args = new Object[fields.length];
+        Class<?>[] argTypes = new Class<?>[fields.length];
+        
+        for (int i = 0; i < fields.length; i++) {
+            Field field = fields[i];
+            argTypes[i] = field.getType();
+            
+            FixedSection section = field.getAnnotation(FixedSection.class);
+            if (section != null) {
+                switch (section.value()) {
+                    case HEADER:
+                        args[i] = header;
+                        break;
+                    case DATA:
+                        args[i] = dataList;
+                        break;
+                    case TRAILER:
+                        args[i] = trailer;
+                        break;
+                    case END:
+                        args[i] = end;
+                        break;
+                }
+            } else {
+                args[i] = getDefaultValue(field.getType());
+            }
+        }
+        
+        Constructor<T> constructor = structureClass.getDeclaredConstructor(argTypes);
+        return constructor.newInstance(args);
+    }
+    
+    private <T> T createPojoInstance(Class<T> structureClass, StructureInfo info,
+                                      Object header, List<Object> dataList, Object trailer, Object end) throws Exception {
+        T instance = structureClass.getDeclaredConstructor().newInstance();
+        
+        Field[] fields = structureClass.getDeclaredFields();
+        for (Field field : fields) {
+            FixedSection section = field.getAnnotation(FixedSection.class);
+            if (section == null) continue;
+            
+            field.setAccessible(true);
+            switch (section.value()) {
+                case HEADER:
+                    field.set(instance, header);
+                    break;
+                case DATA:
+                    field.set(instance, dataList);
+                    break;
+                case TRAILER:
+                    field.set(instance, trailer);
+                    break;
+                case END:
+                    field.set(instance, end);
+                    break;
+            }
+        }
+        
+        return instance;
+    }
+    
+    /**
+     * Helper class to store structure analysis information.
+     */
+    private static class StructureInfo {
+        String lineIdentifierField;
+        @SuppressWarnings("unused")
+        Field headerField;
+        @SuppressWarnings("unused")
+        Field dataField;
+        @SuppressWarnings("unused")
+        Field trailerField;
+        @SuppressWarnings("unused")
+        Field endField;
+        Class<?> headerClass;
+        Class<?> dataClass;
+        Class<?> trailerClass;
+        Class<?> endClass;
+    }
+    
     /**
      * default value of each types
      * @param type type of field
